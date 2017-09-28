@@ -1,0 +1,175 @@
+---
+- name: Install and Configure JBoss Fuse + RHSSO
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    VERSION_RHSSO: "2.4.0.Final-redhat-1"
+    VERSION_FUSE: "6.3.0.redhat-283"
+    KARAF_IP: "127.0.0.1"
+  tasks:
+  - name: get RHSSO
+    get_url:
+      url: http://download-node-02.eng.bos.redhat.com/brewroot/repos/sso-7.1-build/latest/maven/org/keycloak/keycloak-server-dist/{{ VERSION_RHSSO }}/keycloak-server-dist-{{ VERSION_RHSSO }}.zip
+      dest: ./keycloak-server-dist-{{ VERSION_RHSSO }}.zip
+  - name: get FUSE
+    get_url:
+      url: http://fusewin.tpb.lab.eng.brq.redhat.com:8081/nexus/content/groups/fuse-all/org/jboss/fuse/jboss-fuse-karaf/{{ VERSION_FUSE }}/jboss-fuse-karaf-{{ VERSION_FUSE }}.zip
+      dest: ./jboss-fuse-karaf-{{ VERSION_FUSE }}.zip
+
+  ## download sample rh-sso realm config
+  # this realms definition needs to be imported on rh-sso (they will be imported automatically in a later step)
+  - name: get demorealm.json
+    get_url:
+      url: https://raw.githubusercontent.com/keycloak/keycloak/654601c92ca910af560e1befba458da5c3b16236/examples/fuse/demorealm.json
+      dest: ./demorealm.json
+  ## these are client config files
+
+  # used for adapters on server 
+  - name: get keycloak-hawtio.json
+    get_url:
+      url: https://raw.githubusercontent.com/hawtio/hawtio/d81b50dd9f502160d50fd990707c3fe05a3bcbd5/sample-keycloak-integration/keycloak-hawtio.json
+      dest: ./keycloak-hawtio.json
+  # used for adapters on client 
+  - name: get keycloak-hawtio-client.json
+    get_url:
+      url: https://raw.githubusercontent.com/hawtio/hawtio/d81b50dd9f502160d50fd990707c3fe05a3bcbd5/sample-keycloak-integration/keycloak-hawtio-client.json
+      dest: ./keycloak-hawtio-client.json
+  # used by karaf cli
+  - name: get keycloak-direct-access.json
+    get_url:
+      url: https://raw.githubusercontent.com/keycloak/keycloak/654601c92ca910af560e1befba458da5c3b16236/examples/fuse/fuse-admin/keycloak-direct-access.json
+      dest: ./keycloak-direct-access.json
+
+  - name: change port in sample realm configs
+    replace:
+      path: "{{ item }}"
+      regexp: '8081'
+      replace: '8080'
+    with_items:
+      - keycloak-hawtio.json
+      - keycloak-hawtio-client.json
+
+  - name: collect files to delete
+    find:
+      paths: .
+      patterns: "rh-sso-*,jboss-fuse-{{ VERSION_FUSE }}"
+      file_type: 'directory'
+      # file_type: any  # Added in ansible 2.3
+    register: files_to_delete
+
+  - name: delete old files
+    file:
+      state: absent
+      path: "{{ item.path }}"
+    with_items: "{{ files_to_delete.files }}"
+
+  - name: extract distros
+    unarchive:
+      src: "{{ item }}"
+      dest: .
+    with_items:
+      - keycloak-server-dist-{{ VERSION_RHSSO }}.zip
+      - jboss-fuse-karaf-{{ VERSION_FUSE }}.zip
+
+  - name: find rh-sso base folder
+    find:
+      paths: .
+      patterns: "rh-sso-*"
+      file_type: 'directory'
+    register: rhssobase
+
+  - name: expose rh-sso as a variable
+    set_fact:
+      HOME_RHSSO: "{{ rhssobase.files[0].path }}"
+
+  - name: find fuse base folder
+    find:
+      paths: .
+      patterns: "jboss-fuse-{{ VERSION_FUSE }}"
+      file_type: 'directory'
+    register: fusebase
+
+  - name: expose fuse as a variable
+    set_fact:
+      HOME_FUSE: "{{ fusebase.files[0].path }}"
+
+  - name: start RHSSO in background and import base realm
+    shell: "({{ HOME_RHSSO }}/bin/standalone.sh -Djboss.http.port=8080 -Dkeycloak.import={{ playbook_dir }}/demorealm.json > rh-sso.cli.log 2>&1 &)"
+    
+  - name: enable admin user in jboss fuse
+    replace:
+      path: "{{ HOME_FUSE }}/etc/users.properties"
+      regexp: '#admin'
+      replace: 'admin'
+
+  - name: copy keycloak json files in jboss fuse etc/ folder
+    copy:
+      src: "{{ item }}"
+      dest: "{{ HOME_FUSE }}/etc"
+    with_items:
+      - keycloak-hawtio.json        # required by hawtio servlets
+      - keycloak-hawtio-client.json # required by hawtio javascript
+      - keycloak-direct-access.json # required by karaf cli
+
+  - name: configure jboss/etc/system.properties
+    blockinfile:
+      path: "{{ HOME_FUSE }}/etc/system.properties"
+      block: |
+        hawtio.keycloakEnabled=true
+        hawtio.realm=keycloak
+        hawtio.keycloakClientConfig=${karaf.base}/etc/keycloak-hawtio-client.json
+        hawtio.rolePrincipalClasses=org.keycloak.adapters.jaas.RolePrincipal,org.apache.karaf.jaas.boot.principal.RolePrincipal
+
+  - name: start JBoss Fuse 
+    shell: "{{ HOME_FUSE }}/bin/start"
+
+  - name: karaf - wait for ssh
+    wait_for:
+      port: 8101
+      host: '{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}'
+      delay: 10
+
+  - name: karaf - wait for bootstrap
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"wait-for-service -t 300000 io.fabric8.api.BootstrapComplete\""
+
+  - name: karaf - wait for critical component to be available
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"wait-for-service -e -t 3000 '(&(objectClass=org.apache.felix.service.command.Function)(osgi.command.function=propappend))'\""
+
+  - name: karaf - add maven repo to get rh-sso features
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"propappend --pid org.ops4j.pax.url.mvn org.ops4j.pax.url.mvn.repositories ,http://download-node-02.eng.bos.redhat.com/brewroot/repos/sso-7.1-build/latest/maven/@id=brew\""
+
+  - name: karaf - wait for features service
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"wait-for-service -t 300000 org.apache.karaf.features.FeaturesService\""
+
+
+
+  - name: karaf - install the keycloak features repo
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"features:addurl mvn:org.keycloak/keycloak-osgi-features/{{ VERSION_RHSSO }}/xml/features\""
+
+  - name: karaf - install the sample project features repo
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"features:addurl mvn:org.keycloak.example.demo/keycloak-fuse-example-features/{{ VERSION_RHSSO }}/xml/features\""
+
+  - name: karaf - install the sample project feature
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"features:install keycloak-fuse-6.3-example\""
+
+  - name: karaf - just show that an additional endpoint has been installed with a feature
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"web:list | tail -n 1\""
+
+  - name: karaf - enable rh-sso keycloak realm for jmx
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"config:propset --pid org.apache.karaf.management jmxRealm keycloak\""
+
+  - name: karaf - enable rh-sso keycloak realm for ssh
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"features:addurl mvn:org.keycloak.example.demo/keycloak-fuse-example-features/{{ VERSION_RHSSO }}/xml/features\""
+
+  - name: karaf - config:propset --pid org.apache.karaf.shell sshRealm keycloak
+    command: "{{ HOME_FUSE }}/bin/client -u admin -p admin -h localhost \"config:propset --pid org.apache.karaf.shell sshRealm keycloak\""
+
+  - name: recap
+    debug:
+      msg: >
+        new credentials are admin/password
+        RHSSO admin console: http://localhost:8080
+        Sample Fuse application protected by RHSSO: http://localhost:8181/customer-portal
+          non-admin user, u: bburke@redhat.com, p: password
+          admin user, u: admin, p: admin
